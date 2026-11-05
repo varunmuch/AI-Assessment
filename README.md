@@ -60,7 +60,8 @@ uvicorn task2_mcp_gateway.gateway:app --port 9000      # tokens: admin-token, vi
 
 **Beyond the brief**
 - **Downstream failure**: if downstream is unreachable or times out (10 s), the gateway returns
-  HTTP 502 with error `-32002 "Downstream unavailable"` and the original id.
+  HTTP 502 with error `-32003 "Downstream unavailable"` and the original id. The code is in the
+  server-defined range and avoids `-32002`, which MCP uses for "Resource not found".
 - **Notifications** (no `id` member): they pass the same checks but never get a JSON-RPC body. The
   gateway returns 202 (or 401 / 502) with an empty body. Denied notifications are dropped, not
   forwarded. A request with `"id": null` is a request, not a notification, and gets a response.
@@ -160,6 +161,7 @@ uvicorn task4_model_router.router:app --port 8200
 
 **Task 2**
 - The 401 body uses code -32000. A token error takes priority over parse errors.
+- The `Bearer` scheme is matched case-insensitively (RFC 9110 §11.1); the token itself is exact.
 - A `tools/call` without a string `params.name` returns -32602. Batch requests return -32600.
 - The downstream URL, the timeout and the token map are constants in code.
 - The `admin_` prefix match is case-sensitive, as the brief states it.
@@ -174,7 +176,8 @@ uvicorn task4_model_router.router:app --port 8200
 
 **Task 4**
 - The tenant key is the full bearer token. Any bearer token counts as a tenant, because
-  validating keys is outside the brief. DB: `rate_limits.db`.
+  validating keys is outside the brief. Keys are stored as SHA-256 hashes, never raw, and the
+  `Bearer` scheme is case-insensitive. DB: `rate_limits.db`.
 - `max_tokens` is optional (minimum 1). It's forwarded only if the client sent it; otherwise the
   provider uses its own default, and 256 output tokens are reserved until usage is settled.
 - Only the primary fails over. Other provider errors, including a backup timeout (also 3 s),

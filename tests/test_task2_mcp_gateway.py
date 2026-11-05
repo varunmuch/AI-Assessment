@@ -73,6 +73,13 @@ async def test_missing_or_unknown_token_is_401_jsonrpc(client, downstream, heade
     assert downstream.state.received == []
 
 
+@pytest.mark.parametrize("header", ["bearer admin-token", "BEARER admin-token", "Bearer   admin-token"])
+async def test_bearer_scheme_is_case_insensitive(client, downstream, header):
+    r = await client.post("/", json=call("admin_reset_key"), headers={"Authorization": header})
+    assert r.json()["result"]["content"][0]["text"] == "ran admin_reset_key"
+    assert downstream.state.received == [("tools/call", {"name": "admin_reset_key"})]
+
+
 # --- Forwarding ----------------------------------------------------------
 
 async def test_tools_list_forwarded_unchanged(client, downstream):
@@ -143,7 +150,7 @@ async def test_downstream_failure_returns_jsonrpc_error_with_id(error):
     assert r.json() == {
         "jsonrpc": "2.0",
         "id": "req-5",
-        "error": {"code": -32002, "message": "Downstream unavailable"},
+        "error": {"code": -32003, "message": "Downstream unavailable"},
     }
 
 

@@ -1,6 +1,8 @@
 """Task 4: timeout races, concurrency at the limit, eviction, isolation, fallback, sanitization."""
 
 import asyncio
+import hashlib
+import sqlite3
 
 import httpx
 import pytest
@@ -262,3 +264,26 @@ async def test_default_output_reservation_without_max_tokens(env):
     headers = {"Authorization": "Bearer tenant-a"}
     assert (await gateway.post("/v1/chat/completions", headers=headers, json=no_max)).status_code == 200
     assert (await gateway.post("/v1/chat/completions", headers=headers, json=no_max)).status_code == 429
+
+
+# --- API keys --------------------------------------------------------------
+
+@pytest.mark.parametrize("scheme", ["bearer", "BEARER"])
+async def test_bearer_scheme_is_case_insensitive(env, scheme):
+    gateway, *_ = env
+    assert (await chat(gateway, key="tenant-a", prompt="", max_tokens=FULL)).status_code == 200
+    r = await gateway.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"{scheme} tenant-a"},
+        json={"messages": [{"role": "user", "content": ""}], "max_tokens": 1},
+    )
+    assert r.status_code == 429  # accepted, and counted against the same tenant
+
+
+async def test_api_keys_are_stored_hashed(env, tmp_path):
+    gateway, *_ = env
+    assert (await chat(gateway, key="sk-secret-123")).status_code == 200
+    db = tmp_path / "usage.db"
+    rows = sqlite3.connect(db).execute("SELECT tenant FROM usage").fetchall()
+    assert rows == [(hashlib.sha256(b"sk-secret-123").hexdigest(),)]
+    assert b"sk-secret-123" not in db.read_bytes()

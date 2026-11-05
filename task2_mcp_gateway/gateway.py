@@ -16,6 +16,7 @@ logger = logging.getLogger("task2")
 DOWNSTREAM_URL = "http://127.0.0.1:9001/"
 DOWNSTREAM_TIMEOUT = 10.0  # seconds
 TOKEN_ROLES = {"admin-token": "admin", "viewer-token": "viewer"}
+DOWNSTREAM_UNAVAILABLE = -32003  # server-defined; MCP already uses -32002 for "Resource not found"
 
 
 def rpc_error(request_id, code: int, message: str, status: int = 200) -> JSONResponse:
@@ -24,8 +25,9 @@ def rpc_error(request_id, code: int, message: str, status: int = 200) -> JSONRes
 
 
 def role_for(request: Request) -> str | None:
-    scheme, _, token = request.headers.get("authorization", "").partition(" ")
-    return TOKEN_ROLES.get(token) if scheme == "Bearer" else None
+    # The auth scheme is case-insensitive (RFC 9110 section 11.1).
+    scheme, _, token = request.headers.get("authorization", "").strip().partition(" ")
+    return TOKEN_ROLES.get(token.strip()) if scheme.lower() == "bearer" else None
 
 
 def is_valid_request(payload) -> bool:
@@ -89,7 +91,7 @@ def create_app(downstream_url: str = DOWNSTREAM_URL, transport: httpx.AsyncBaseT
             )
         except httpx.HTTPError:
             logger.warning("Downstream request failed", exc_info=True)
-            return reply_error(-32002, "Downstream unavailable", status=502)
+            return reply_error(DOWNSTREAM_UNAVAILABLE, "Downstream unavailable", status=502)
         if notification:
             return Response(status_code=202)
         return Response(upstream.content, status_code=upstream.status_code, media_type="application/json")

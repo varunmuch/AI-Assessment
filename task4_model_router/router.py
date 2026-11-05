@@ -4,6 +4,7 @@ Run: uvicorn task4_model_router.router:app --port 8200
 """
 
 import asyncio
+import hashlib
 import logging
 import math
 import time
@@ -111,8 +112,10 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def completions(request: Request):
-        scheme, _, api_key = request.headers.get("authorization", "").partition(" ")
-        if scheme != "Bearer" or not api_key:
+        # The auth scheme is case-insensitive (RFC 9110 section 11.1).
+        scheme, _, api_key = request.headers.get("authorization", "").strip().partition(" ")
+        api_key = api_key.strip()
+        if scheme.lower() != "bearer" or not api_key:
             return gateway_error(401, "unauthorized", "Missing or invalid API key.")
         try:
             req = ChatRequest.model_validate_json(await request.body())
@@ -122,7 +125,8 @@ def create_app(
         cost = estimate_tokens(req)
         if cost > limiter.limit:  # could never fit, so it is a bad request rather than a rate limit
             return gateway_error(400, "request_too_large", "Request exceeds the per-minute token limit.")
-        reservation = await limiter.reserve(api_key, cost)
+        tenant = hashlib.sha256(api_key.encode()).hexdigest()  # raw keys never reach the database
+        reservation = await limiter.reserve(tenant, cost)
         if reservation is None:
             return gateway_error(429, "rate_limited", "Token rate limit exceeded. Retry later.")
 
