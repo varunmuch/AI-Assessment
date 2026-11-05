@@ -81,8 +81,12 @@ def create_app(downstream_url: str = DOWNSTREAM_URL, transport: httpx.AsyncBaseT
             if name.startswith("admin_") and role != "admin":
                 return reply_error(-32001, "Unauthorized Tool Call")
 
+        # Forward the payload that was checked, not the raw bytes: with duplicate keys, the
+        # downstream's JSON parser could otherwise read a different tool name than the one authorized.
         try:
-            upstream = await client.post(downstream_url, content=raw, headers={"content-type": "application/json"})
+            upstream = await client.post(
+                downstream_url, content=json.dumps(payload), headers={"content-type": "application/json"}
+            )
         except httpx.HTTPError:
             logger.warning("Downstream request failed", exc_info=True)
             return reply_error(-32002, "Downstream unavailable", status=502)

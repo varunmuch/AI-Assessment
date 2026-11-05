@@ -5,6 +5,8 @@ import time
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 
 from task3_llm_guardrail import gateway, mock_provider
 from task3_llm_guardrail.redactor import MAX_HOLDBACK, REDACTED, StreamRedactor
@@ -126,3 +128,100 @@ async def test_interrupted_stream_is_not_reported_as_complete(failure):
                     lines = [line async for line in r.aiter_lines() if line.startswith("data: ")]
     assert "data: [DONE]" not in lines
     assert json.loads(lines[-1][6:])["error"]["type"] == "upstream_error"
+
+
+# --- SSE framing and malformed events -------------------------------------
+
+def raw_provider(*events: str):
+    """A provider that streams the given SSE text verbatim."""
+    app = FastAPI()
+
+    @app.post("/v1/chat/completions")
+    async def completions():
+        async def stream():
+            for event in events:
+                yield event
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    return app
+
+
+def delta_chunk(delta: dict, finish_reason=None) -> dict:
+    return {"id": "x", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
+
+
+async def gateway_lines(*events: str) -> list[str]:
+    with serve(raw_provider(*events)) as provider_url:
+        with serve(gateway.create_app(f"{provider_url}/v1/chat/completions")) as url:
+            async with httpx.AsyncClient(timeout=10) as client:
+                async with client.stream("POST", f"{url}/v1/chat/completions", json={"messages": []}) as r:
+                    assert r.status_code == 200
+                    return [line async for line in r.aiter_lines() if line.startswith("data: ")]
+
+
+def contents(lines: list[str]) -> str:
+    return "".join(
+        choice["delta"].get("content", "")
+        for line in lines if line.startswith("data: {")
+        for choice in json.loads(line[6:]).get("choices", [])
+    )
+
+
+async def test_sse_framing_variants_are_parsed():
+    events = (
+        ": keep-alive comment\n\n"
+        f"data:{json.dumps(delta_chunk({'content': 'no space a@b.com '}))}\n\n"  # no space after colon
+        'data: {"id": "x", "choices": [{"index": 0,\n'  # one event split over two data lines
+        'data: "delta": {"content": "two lines 123-45-6789"}, "finish_reason": null}]}\n\n'
+        f"event: message\r\ndata: {json.dumps(delta_chunk({}, 'stop'))}\r\n\r\n"  # CRLF and an event field
+        "data: [DONE]"  # last event without a trailing blank line
+    )
+    lines = await gateway_lines(events)
+    assert contents(lines) == f"no space {REDACTED} two lines {REDACTED}"
+    assert lines[-1] == "data: [DONE]"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["data: {not json\n\n", "data: [1, 2]\n\n", 'data: {"choices": "nope"}\n\n',
+     'data: {"choices": [{"index": "0", "delta": {}}]}\n\n'],
+    ids=["invalid_json", "not_object", "choices_not_list", "bad_index"],
+)
+async def test_malformed_event_ends_with_error_event(bad):
+    lines = await gateway_lines(f"data: {json.dumps(delta_chunk({'content': 'hello wor'}))}\n\n", bad, "data: [DONE]\n\n")
+    assert contents(lines) == "hello "  # released before the failure; held "wor" is dropped
+    assert "data: [DONE]" not in lines
+    assert json.loads(lines[-1][6:])["error"]["type"] == "upstream_error"
+
+
+# --- Other generated text in deltas ----------------------------------------
+
+async def test_tool_call_arguments_and_refusals_are_redacted():
+    args = '{"to": "jane.doe@example.com", "ssn": "123-45-6789"}'
+    events = [
+        delta_chunk({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                                     "function": {"name": "send", "arguments": ""}}]}),
+        *(delta_chunk({"tool_calls": [{"index": 0, "function": {"arguments": args[i:i + 4]}}]})
+          for i in range(0, len(args), 4)),
+        delta_chunk({"refusal": "My card is 4111 1111 1111 1111"}),
+        delta_chunk({}, "tool_calls"),
+    ]
+    lines = await gateway_lines(*(f"data: {json.dumps(e)}\n\n" for e in events), "data: [DONE]\n\n")
+    deltas = [c["delta"] for line in lines if line.startswith("data: {")
+              for c in json.loads(line[6:])["choices"]]
+    streamed_args = "".join(call["function"].get("arguments", "")
+                            for d in deltas for call in d.get("tool_calls", []))
+    assert json.loads(streamed_args) == {"to": REDACTED, "ssn": REDACTED}
+    assert "".join(d.get("refusal", "") for d in deltas) == f"My card is {REDACTED}"
+    assert deltas[0]["tool_calls"][0]["function"]["name"] == "send"
+
+
+async def test_usage_chunk_without_choices_is_forwarded():
+    usage = {"id": "x", "object": "chat.completion.chunk", "choices": [], "usage": {"total_tokens": 7}}
+    lines = await gateway_lines(
+        f"data: {json.dumps(delta_chunk({'content': 'hi'}, 'stop'))}\n\n",
+        f"data: {json.dumps(usage)}\n\n",
+        "data: [DONE]\n\n",
+    )
+    assert json.loads(lines[-2][6:])["usage"] == {"total_tokens": 7}

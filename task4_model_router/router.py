@@ -22,6 +22,9 @@ logger = logging.getLogger("task4")
 PRIMARY_URL = "http://127.0.0.1:8201/v1/chat/completions"
 BACKUP_URL = "http://127.0.0.1:8202/v1/chat/completions"
 PROVIDER_TIMEOUT = 3.0  # seconds; the backup uses the same limit
+TOKENS_PER_MESSAGE = 4  # role and separators around each message (OpenAI chat format)
+REPLY_PRIMING_TOKENS = 3  # tokens that start the assistant's reply
+DEFAULT_OUTPUT_RESERVATION = 256  # output tokens reserved when the client sends no max_tokens
 
 
 class Message(BaseModel):
@@ -31,7 +34,7 @@ class Message(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[Message]
-    max_tokens: int = Field(256, ge=1)
+    max_tokens: int | None = Field(None, ge=1)  # forwarded only if the client sent it
 
 
 class Failover(Exception):
@@ -49,9 +52,27 @@ def gateway_error(status: int, code: str, message: str) -> JSONResponse:
 
 
 def estimate_tokens(req: ChatRequest) -> int:
-    """Approximate reservation: charged up front, before the provider answers."""
-    prompt_chars = sum(len(m.content) for m in req.messages)
-    return math.ceil(prompt_chars / 4) + req.max_tokens
+    """Tokens to reserve before the provider answers: an estimate of the prompt plus the output limit.
+
+    The reservation is settled to the provider's reported usage afterwards.
+    """
+    prompt = sum(math.ceil(len(m.content) / 4) + TOKENS_PER_MESSAGE for m in req.messages)
+    output = req.max_tokens if req.max_tokens is not None else DEFAULT_OUTPUT_RESERVATION
+    return prompt + REPLY_PRIMING_TOKENS + output
+
+
+def reported_tokens(result: dict) -> int | None:
+    """Total tokens the provider says it used, or None if it did not say."""
+    usage = result.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    total = usage.get("total_tokens")
+    if type(total) is int and total >= 0:
+        return total
+    parts = usage.get("prompt_tokens"), usage.get("completion_tokens")
+    if all(type(n) is int and n >= 0 for n in parts):
+        return sum(parts)
+    return None
 
 
 def create_app(
@@ -79,7 +100,14 @@ def create_app(
         if resp.status_code != 200:
             logger.warning("Provider %s returned %s", url, resp.status_code)
             raise UpstreamError()
-        return resp.json()
+        try:
+            result = resp.json()
+        except ValueError:
+            result = None
+        if not isinstance(result, dict):
+            logger.warning("Provider %s returned an invalid body", url)
+            raise UpstreamError()
+        return result
 
     @app.post("/v1/chat/completions")
     async def completions(request: Request):
@@ -91,18 +119,28 @@ def create_app(
         except ValidationError:
             return gateway_error(400, "invalid_request", "Request body is invalid.")
 
-        if not await limiter.try_consume(api_key, estimate_tokens(req)):
+        cost = estimate_tokens(req)
+        if cost > limiter.limit:  # could never fit, so it is a bad request rather than a rate limit
+            return gateway_error(400, "request_too_large", "Request exceeds the per-minute token limit.")
+        reservation = await limiter.reserve(api_key, cost)
+        if reservation is None:
             return gateway_error(429, "rate_limited", "Token rate limit exceeded. Retry later.")
 
-        payload = req.model_dump()
+        payload = req.model_dump(exclude_none=True)
         try:
             try:
-                return await call(primary_url, payload, is_primary=True)
+                result = await call(primary_url, payload, is_primary=True)
             except Failover:
                 logger.info("Failing over to backup provider")
-                return await call(backup_url, payload, is_primary=False)
+                result = await call(backup_url, payload, is_primary=False)
         except UpstreamError:
+            await limiter.release(reservation)  # the tenant received nothing
             return gateway_error(502, "upstream_unavailable", "The model provider is unavailable.")
+
+        # Without reported usage, the reservation stands as the charge.
+        if (used := reported_tokens(result)) is not None:
+            await limiter.settle(reservation, used)
+        return result
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException):

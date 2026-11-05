@@ -1,5 +1,7 @@
 """Task 2: wire-format parsing, proxy forwarding, authorization."""
 
+import json
+
 import httpx
 import pytest
 
@@ -108,6 +110,23 @@ async def test_admin_can_call_admin_tool(client, downstream):
     r = await client.post("/", json=call("admin_reset_key"), headers=ADMIN)
     assert r.json()["result"]["content"][0]["text"] == "ran admin_reset_key"
     assert downstream.state.received == [("tools/call", {"name": "admin_reset_key"})]
+
+
+async def test_duplicate_name_key_cannot_smuggle_admin_tool():
+    """The gateway checks the last "name"; a first-wins downstream must not see the other one."""
+    received = []
+
+    def downstream(request: httpx.Request) -> httpx.Response:
+        received.append(request.content)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 7, "result": {"content": []}})
+
+    app = gateway.create_app("http://downstream/", transport=httpx.MockTransport(downstream))
+    raw = b'{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"admin_reset_key","name":"get_status"}}'
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gw") as c:
+        r = await c.post("/", content=raw, headers=VIEWER)
+    assert r.status_code == 200
+    assert len(received) == 1 and b"admin_reset_key" not in received[0]
+    assert json.loads(received[0])["params"] == {"name": "get_status"}
 
 
 # --- Downstream failures -------------------------------------------------
