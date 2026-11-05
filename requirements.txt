@@ -1,0 +1,8 @@
+mcp
+pydantic>=2
+fastapi
+uvicorn
+httpx
+aiosqlite
+pytest
+pytest-asyncio
